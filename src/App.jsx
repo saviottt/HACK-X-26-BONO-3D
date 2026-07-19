@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ThreeDViewport } from './components/ThreeDViewport';
+import { PreprocessingPanel } from './components/PreprocessingPanel';
 import { processXrayImage, postProcessAIDepthMap } from './utils/imageProcessing';
 import { generateSampleXrays } from './utils/sampleXrays';
 import { Upload, Box, RefreshCw, ArrowRight, Sparkles, Brain } from 'lucide-react';
@@ -12,6 +13,21 @@ export function App() {
   const [isConverting, setIsConverting] = useState(false);
   const [processedData, setProcessedData] = useState(null);
   const [defaultSample, setDefaultSample] = useState(null);
+
+  // Preprocessor & Render Options State
+  const [samples, setSamples] = useState([]);
+  const [activeSampleId, setActiveSampleId] = useState('femur');
+  const [options, setOptions] = useState({
+    brightness: 0,
+    contrast: 20,
+    threshold: 0, // 0 = Auto (Otsu)
+    engine: 'procedural', // 'procedural' or 'ai'
+    depthScale: 25,
+    translucency: 0.15,
+    roughness: 0.35,
+    marrowEnabled: true,
+    theme: 'ivory',
+  });
 
   // AI Worker State
   const [worker, setWorker] = useState(null);
@@ -49,12 +65,6 @@ export function App() {
           setAiStatus(status);
           break;
         case 'complete':
-          // We have the raw tensor back from the worker, now process it
-          setAiStatus('Processing Depth Map...');
-          
-          // Need the original image to draw onto canvas in postProcessAIDepthMap
-          // But we don't have it here directly, so we just pass a new Image object 
-          // that we'll store in a ref or access via the DOM.
           break;
         case 'error':
           console.error("AI Worker Error:", error);
@@ -71,52 +81,167 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const samples = generateSampleXrays();
-    if (samples.length > 0) setDefaultSample(samples[0].dataUrl);
+    const list = generateSampleXrays();
+    setSamples(list);
+    if (list.length > 0) {
+      setDefaultSample(list[0].dataUrl);
+      setSelectedImageSrc(list[0].dataUrl);
+      setActiveSampleId(list[0].id);
+    }
   }, []);
+
+  // Auto-switch to AI engine when model is loaded and ready
+  useEffect(() => {
+    if (isAiReady) {
+      setOptions(prev => ({ ...prev, engine: 'ai' }));
+    }
+  }, [isAiReady]);
+
+  // Real-time updates when filters or options change
+  useEffect(() => {
+    if (!isConverted || !selectedImageSrc) return;
+
+    const runReprocessing = () => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        if (options.engine === 'ai' && worker && isAiReady) {
+          setAiStatus('Running AI Depth Estimation...');
+          worker.postMessage({
+            type: 'process',
+            image: selectedImageSrc,
+            resolution: 384
+          });
+
+          const onComplete = (e) => {
+            if (e.data.type === 'complete') {
+              const { depthMap, width, height } = e.data;
+              const result = postProcessAIDepthMap(img, depthMap, width, height, 384, options);
+              setProcessedData(result);
+              setAiStatus('');
+              worker.removeEventListener('message', onComplete);
+            } else if (e.data.type === 'error') {
+              setAiStatus(`Error: ${e.data.error}`);
+              worker.removeEventListener('message', onComplete);
+            }
+          };
+          worker.addEventListener('message', onComplete);
+        } else {
+          const result = processXrayImage(img, {
+            brightness: options.brightness,
+            contrast: options.contrast,
+            threshold: options.threshold,
+            resolution: 384
+          });
+          setProcessedData(result);
+        }
+      };
+      img.src = selectedImageSrc;
+    };
+
+    // Debounce the AI generation to prevent backlogging the worker during rapid slider drags
+    if (options.engine === 'ai') {
+      const timer = setTimeout(runReprocessing, 250);
+      return () => clearTimeout(timer);
+    } else {
+      runReprocessing();
+    }
+  }, [options.brightness, options.contrast, options.threshold, options.engine, isConverted, selectedImageSrc, isAiReady, worker]);
 
   const handleFileUpload = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => { setSelectedImageSrc(ev.target.result); setIsConverted(false); };
+    reader.onload = (ev) => {
+      setSelectedImageSrc(ev.target.result);
+      setActiveSampleId('custom');
+      setIsConverted(false);
+    };
     reader.readAsDataURL(file);
   };
 
+  const handleSelectSample = (sample) => {
+    setSelectedImageSrc(sample.dataUrl);
+    setActiveSampleId(sample.id);
+
+    // If already in 3D mode, automatically generate the model for the new sample
+    if (isConverted) {
+      setIsConverting(true);
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        if (options.engine === 'ai' && worker && isAiReady) {
+          setAiStatus('Running AI Depth Estimation...');
+          worker.postMessage({
+            type: 'process',
+            image: sample.dataUrl,
+            resolution: 384
+          });
+          const onComplete = (e) => {
+            if (e.data.type === 'complete') {
+              const { depthMap, width, height } = e.data;
+              const result = postProcessAIDepthMap(img, depthMap, width, height, 384, options);
+              setProcessedData(result);
+              setIsConverting(false);
+              setIsConverted(true);
+              worker.removeEventListener('message', onComplete);
+            } else if (e.data.type === 'error') {
+              setIsConverting(false);
+              worker.removeEventListener('message', onComplete);
+            }
+          };
+          worker.addEventListener('message', onComplete);
+        } else {
+          const result = processXrayImage(img, {
+            brightness: options.brightness,
+            contrast: options.contrast,
+            threshold: options.threshold,
+            resolution: 384
+          });
+          setProcessedData(result);
+          setIsConverting(false);
+          setIsConverted(true);
+        }
+      };
+      img.src = sample.dataUrl;
+    }
+  };
+
   const handleUseSample = () => {
-    if (defaultSample) { setSelectedImageSrc(defaultSample); setIsConverted(false); }
+    if (defaultSample) {
+      setSelectedImageSrc(defaultSample);
+      setActiveSampleId('femur');
+      setIsConverted(false);
+    }
   };
 
   const handleConvert = () => {
     if (!selectedImageSrc) return;
     setIsConverting(true);
     
-    // We will use the AI worker if it is ready, otherwise fallback to procedural
-    if (worker && isAiReady) {
+    if (options.engine === 'ai' && worker && isAiReady) {
       setAiStatus('Preparing image...');
       
       const img = new Image();
       img.crossOrigin = 'anonymous';
       img.onload = () => {
         setAiStatus('Running AI Depth Estimation...');
-        
-        // We can pass the selectedImageSrc to the worker for transformers.js
         worker.postMessage({
           type: 'process',
           image: selectedImageSrc,
           resolution: 384
         });
 
-        // We need a one-time listener for the complete event to finish the pipeline
         const onComplete = (e) => {
           if (e.data.type === 'complete') {
             const { depthMap, width, height } = e.data;
-            const result = postProcessAIDepthMap(img, depthMap, width, height, 384);
+            const result = postProcessAIDepthMap(img, depthMap, width, height, 384, options);
             setProcessedData(result);
             setIsConverting(false);
             setIsConverted(true);
             worker.removeEventListener('message', onComplete);
           } else if (e.data.type === 'error') {
+             setIsConverting(false);
              worker.removeEventListener('message', onComplete);
           }
         };
@@ -125,12 +250,16 @@ export function App() {
       img.src = selectedImageSrc;
 
     } else {
-      // Fallback to procedural (or if they click convert before AI is downloaded)
       const img = new Image();
       img.crossOrigin = 'anonymous';
       const run = () => {
         requestAnimationFrame(() => {
-          const result = processXrayImage(img, { brightness: 0, contrast: 20, threshold: 0, resolution: 384 });
+          const result = processXrayImage(img, {
+            brightness: options.brightness,
+            contrast: options.contrast,
+            threshold: options.threshold,
+            resolution: 384
+          });
           setProcessedData(result);
           setIsConverting(false);
           setIsConverted(true);
@@ -142,7 +271,17 @@ export function App() {
     }
   };
 
-  const handleReset = () => { setSelectedImageSrc(null); setIsConverted(false); setProcessedData(null); setAiStatus(''); };
+  const handleReset = () => {
+    setSelectedImageSrc(defaultSample || null);
+    setActiveSampleId(defaultSample ? 'femur' : '');
+    setIsConverted(false);
+    setProcessedData(null);
+    setAiStatus('');
+  };
+
+  const handleOptionsChange = (newOptions) => {
+    setOptions(newOptions);
+  };
 
   return (
     <div
@@ -274,13 +413,32 @@ export function App() {
             )}
           </div>
         ) : (
-          /* ── 3D Viewport — covers the ENTIRE main area ── */
-          <div style={{ position: 'absolute', inset: 0 }}>
-            <ThreeDViewport
-              depthMatrix={processedData?.depthMatrix}
-              resolution={384}
-              activeSampleName="3D Bone Scan"
-            />
+          /* ── 3D Workstation Dashboard ── */
+          <div style={{ position: 'absolute', inset: 0, display: 'flex' }}>
+            {/* Sidebar preprocessor & render controls panel */}
+            <div style={{ width: 380, minWidth: 380, borderRight: '1px solid #1e293b', background: '#090d16', zIndex: 10, display: 'flex', flexDirection: 'column' }}>
+              <PreprocessingPanel
+                samples={samples}
+                activeSampleId={activeSampleId}
+                onSelectSample={handleSelectSample}
+                onCustomUpload={handleFileUpload}
+                options={options}
+                onOptionsChange={handleOptionsChange}
+                processedPreview={processedData?.processedDataUrl}
+                stats={processedData?.stats}
+              />
+            </div>
+            {/* 3D Viewport on the right */}
+            <div style={{ flex: 1, position: 'relative' }}>
+              <ThreeDViewport
+                depthMatrix={processedData?.depthMatrix}
+                resolution={384}
+                activeSampleName="3D Bone Scan"
+                options={options}
+                aspectRatio={processedData?.aspectRatio}
+                maxDist={processedData?.maxDist}
+              />
+            </div>
           </div>
         )}
       </main>

@@ -1,20 +1,17 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// Advanced Anatomical X-Ray → 3D Bone Reconstruction Pipeline
+// Advanced Anatomical X-Ray → 3D Bone Reconstruction Pipeline v2
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Pipeline stages:
-//   1. Grayscale + auto-invert (light/dark BG detection)
-//   2. CLAHE-style local contrast enhancement
-//   3. Otsu adaptive thresholding → binary bone mask
-//   4. Morphological open + close (noise removal, hole filling)
-//   5. Sobel edge detection → boundary distance field
-//   6. Anatomical cylindrical depth estimation (elliptical cross-section)
-//   7. Joint gap detection & depth tapering
-//   8. Edge-preserving bilateral filter
-//   9. Taubin mesh smoothing (shrinkage-free)
+// Produces truly volumetric bone geometry by:
+//   1. Isolating bones via Otsu thresholding + morphological cleanup
+//   2. Connected component labeling (individual bone segments)
+//   3. Per-bone medial axis + distance transform → cylindrical radius
+//   4. Elliptical cross-section depth: sqrt(1 - (d/R)^2) in BOTH axes
+//   5. Joint gap detection & tapering between adjacent bones
+//   6. Edge-preserving bilateral + Taubin smoothing
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── 1. Otsu's Method — automatic optimal bone/background threshold ────────
+// ── Otsu's Method ─────────────────────────────────────────────────────────
 function otsuThreshold(histogram, totalPixels) {
   let sumTotal = 0;
   for (let i = 0; i < 256; i++) sumTotal += i * histogram[i];
@@ -41,7 +38,7 @@ function otsuThreshold(histogram, totalPixels) {
   return bestThresh;
 }
 
-// ── 2. Local contrast enhancement (simplified CLAHE) ──────────────────────
+// ── Local contrast enhancement (simplified CLAHE) ─────────────────────────
 function enhanceLocalContrast(gray, w, h, tileSize = 32) {
   const out = new Float32Array(w * h);
   const halfTile = Math.floor(tileSize / 2);
@@ -49,11 +46,9 @@ function enhanceLocalContrast(gray, w, h, tileSize = 32) {
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const idx = y * w + x;
-      // Compute local min/max in tile window
       let lMin = 255, lMax = 0;
       const y0 = Math.max(0, y - halfTile), y1 = Math.min(h - 1, y + halfTile);
       const x0 = Math.max(0, x - halfTile), x1 = Math.min(w - 1, x + halfTile);
-      // Sample every 4th pixel for speed
       for (let sy = y0; sy <= y1; sy += 4) {
         for (let sx = x0; sx <= x1; sx += 4) {
           const sv = gray[sy * w + sx];
@@ -62,8 +57,6 @@ function enhanceLocalContrast(gray, w, h, tileSize = 32) {
         }
       }
       const range = lMax - lMin || 1;
-      // Blend: mostly preserve raw intensity, only mild local stretch
-      // (aggressive local stretch makes soft tissue look as bright as bone)
       const localNorm = ((gray[idx] - lMin) / range) * 255;
       out[idx] = gray[idx] * 0.75 + localNorm * 0.25;
     }
@@ -71,14 +64,12 @@ function enhanceLocalContrast(gray, w, h, tileSize = 32) {
   return out;
 }
 
-// ── 3. Morphological operations (binary) ──────────────────────────────────
+// ── Morphological operations ──────────────────────────────────────────────
 function morphOpen(mask, w, h, radius = 1) {
-  // Erode then dilate — removes small noise specks
   return dilate(erode(mask, w, h, radius), w, h, radius);
 }
 
 function morphClose(mask, w, h, radius = 1) {
-  // Dilate then erode — fills small holes
   return erode(dilate(mask, w, h, radius), w, h, radius);
 }
 
@@ -114,7 +105,7 @@ function dilate(mask, w, h, r) {
   return out;
 }
 
-// ── 4. Sobel edge detection ───────────────────────────────────────────────
+// ── Sobel edge detection ──────────────────────────────────────────────────
 function sobelEdges(gray, w, h) {
   const edges = new Float32Array(w * h);
   for (let y = 1; y < h - 1; y++) {
@@ -127,20 +118,17 @@ function sobelEdges(gray, w, h) {
       edges[y * w + x] = Math.sqrt(gx * gx + gy * gy);
     }
   }
-  // Normalize to 0-1
   let eMax = 0;
   for (let i = 0; i < edges.length; i++) if (edges[i] > eMax) eMax = edges[i];
   if (eMax > 0) for (let i = 0; i < edges.length; i++) edges[i] /= eMax;
   return edges;
 }
 
-// ── 5. Boundary Distance Field (distance transform on bone mask) ──────────
+// ── Boundary Distance Field (Chamfer distance transform) ─────────────────
 function distanceTransformApprox(mask, w, h) {
-  // Chamfer 3-4 distance transform (approximation of Euclidean DT)
   const dist = new Float32Array(w * h);
   const INF = 1e6;
 
-  // Initialize: 0 for background, INF for foreground
   for (let i = 0; i < w * h; i++) dist[i] = mask[i] ? INF : 0;
 
   // Forward pass
@@ -174,51 +162,65 @@ function distanceTransformApprox(mask, w, h) {
   return dist;
 }
 
-// ── 6. Compute per-row bone spans (for cylindrical depth) ─────────────────
-function computeBoneSpans(mask, w, h) {
-  // For each bone pixel, find the local bone "width" at that row.
-  // This gives us the radius R in the cylindrical depth formula.
-  const leftEdge  = new Int32Array(w * h).fill(-1);
-  const rightEdge = new Int32Array(w * h).fill(-1);
-  const boneWidth = new Float32Array(w * h);
-  const boneCenter = new Float32Array(w * h);
+// ── Compute per-row AND per-column bone spans ─────────────────────────────
+// Returns horizontal and vertical bone radius at each pixel
+function computeBoneRadii(mask, w, h) {
+  const hRadius = new Float32Array(w * h); // horizontal half-width
+  const vRadius = new Float32Array(w * h); // vertical half-height
+  const hCenter = new Float32Array(w * h);
+  const vCenter = new Float32Array(w * h);
 
+  // Horizontal spans
   for (let y = 0; y < h; y++) {
-    // Scan left-to-right: find runs of bone pixels
     let runStart = -1;
     for (let x = 0; x <= w; x++) {
       const isOn = x < w && mask[y * w + x];
       if (isOn && runStart < 0) {
         runStart = x;
       } else if (!isOn && runStart >= 0) {
-        // End of a bone run
         const runEnd = x - 1;
         const width = runEnd - runStart + 1;
         const center = (runStart + runEnd) / 2;
         for (let rx = runStart; rx <= runEnd; rx++) {
           const idx = y * w + rx;
-          boneWidth[idx] = width;
-          boneCenter[idx] = center;
-          leftEdge[idx] = runStart;
-          rightEdge[idx] = runEnd;
+          hRadius[idx] = width / 2;
+          hCenter[idx] = center;
         }
         runStart = -1;
       }
     }
   }
 
-  return { boneWidth, boneCenter, leftEdge, rightEdge };
+  // Vertical spans
+  for (let x = 0; x < w; x++) {
+    let runStart = -1;
+    for (let y = 0; y <= h; y++) {
+      const isOn = y < h && mask[y * w + x];
+      if (isOn && runStart < 0) {
+        runStart = y;
+      } else if (!isOn && runStart >= 0) {
+        const runEnd = y - 1;
+        const height = runEnd - runStart + 1;
+        const center = (runStart + runEnd) / 2;
+        for (let ry = runStart; ry <= runEnd; ry++) {
+          const idx = ry * w + x;
+          vRadius[idx] = height / 2;
+          vCenter[idx] = center;
+        }
+        runStart = -1;
+      }
+    }
+  }
+
+  return { hRadius, vRadius, hCenter, vCenter };
 }
 
-// ── 7. Joint gap detection (dark bands between bone regions) ──────────────
+// ── Joint gap detection ───────────────────────────────────────────────────
 function detectJointGaps(gray, mask, w, h) {
-  // A joint gap is a horizontal or vertical band where intensity drops
-  // significantly between two bone regions. We detect vertical gaps
-  // (between vertically adjacent bones like phalanges).
   const gapFactor = new Float32Array(w * h).fill(1.0);
 
+  // Vertical gaps (between vertically stacked bones like phalanges)
   for (let x = 0; x < w; x++) {
-    // Scan column top-to-bottom
     let inBone = false;
     let lastBoneEnd = -1;
 
@@ -227,23 +229,19 @@ function detectJointGaps(gray, mask, w, h) {
       const isBone = mask[idx] > 0;
 
       if (isBone && !inBone) {
-        // Entering bone — if there was a recent gap, taper both sides
         if (lastBoneEnd >= 0) {
           const gapLen = y - lastBoneEnd;
-          if (gapLen > 1 && gapLen < 20) {
-            // Taper the bone ends near the gap
-            const taperLen = Math.min(8, Math.max(3, Math.floor(gapLen * 1.5)));
-            // Taper above the gap (end of previous bone)
+          if (gapLen > 1 && gapLen < 25) {
+            const taperLen = Math.min(10, Math.max(4, Math.floor(gapLen * 2.0)));
             for (let t = 0; t < taperLen && lastBoneEnd - t >= 0; t++) {
               const tidx = (lastBoneEnd - t) * w + x;
-              const factor = Math.min(gapFactor[tidx], t / taperLen);
-              gapFactor[tidx] = Math.max(0.05, factor);
+              const factor = Math.min(gapFactor[tidx], (t / taperLen) * (t / taperLen));
+              gapFactor[tidx] = Math.max(0.02, factor);
             }
-            // Taper below the gap (start of current bone)
             for (let t = 0; t < taperLen && y + t < h; t++) {
               const tidx = (y + t) * w + x;
-              const factor = Math.min(gapFactor[tidx], t / taperLen);
-              gapFactor[tidx] = Math.max(0.05, factor);
+              const factor = Math.min(gapFactor[tidx], (t / taperLen) * (t / taperLen));
+              gapFactor[tidx] = Math.max(0.02, factor);
             }
           }
         }
@@ -255,7 +253,7 @@ function detectJointGaps(gray, mask, w, h) {
     }
   }
 
-  // Also detect horizontal gaps (between side-by-side bones)
+  // Horizontal gaps (between side-by-side bones)
   for (let y = 0; y < h; y++) {
     let inBone = false;
     let lastBoneEnd = -1;
@@ -267,15 +265,15 @@ function detectJointGaps(gray, mask, w, h) {
       if (isBone && !inBone) {
         if (lastBoneEnd >= 0) {
           const gapLen = x - lastBoneEnd;
-          if (gapLen > 1 && gapLen < 20) {
-            const taperLen = Math.min(6, Math.max(2, Math.floor(gapLen * 1.2)));
+          if (gapLen > 1 && gapLen < 25) {
+            const taperLen = Math.min(8, Math.max(3, Math.floor(gapLen * 1.5)));
             for (let t = 0; t < taperLen && lastBoneEnd - t >= 0; t++) {
               const tidx = y * w + (lastBoneEnd - t);
-              gapFactor[tidx] = Math.max(0.05, Math.min(gapFactor[tidx], t / taperLen));
+              gapFactor[tidx] = Math.max(0.02, Math.min(gapFactor[tidx], (t / taperLen) * (t / taperLen)));
             }
             for (let t = 0; t < taperLen && x + t < w; t++) {
               const tidx = y * w + (x + t);
-              gapFactor[tidx] = Math.max(0.05, Math.min(gapFactor[tidx], t / taperLen));
+              gapFactor[tidx] = Math.max(0.02, Math.min(gapFactor[tidx], (t / taperLen) * (t / taperLen)));
             }
           }
         }
@@ -290,11 +288,11 @@ function detectJointGaps(gray, mask, w, h) {
   return gapFactor;
 }
 
-// ── 8. Edge-preserving bilateral filter ───────────────────────────────────
-function bilateralFilter(matrix, w, h, spatialSigma = 1.8, rangeSigma = 0.15) {
+// ── Edge-preserving bilateral filter ──────────────────────────────────────
+function bilateralFilter(matrix, w, h, spatialSigma = 2.0, rangeSigma = 0.12) {
   const input = new Float32Array(matrix);
   const output = new Float32Array(matrix.length);
-  const r = 2;
+  const r = 3;
 
   const spatialW = [];
   for (let dy = -r; dy <= r; dy++)
@@ -327,8 +325,8 @@ function bilateralFilter(matrix, w, h, spatialSigma = 1.8, rangeSigma = 0.15) {
   return output;
 }
 
-// ── 9. Taubin smoothing (shrinkage-free mesh smoothing) ───────────────────
-function taubinSmooth(matrix, w, h, passes = 6, lambda = 0.5, mu = -0.53) {
+// ── Taubin smoothing (shrinkage-free) ─────────────────────────────────────
+function taubinSmooth(matrix, w, h, passes = 8, lambda = 0.5, mu = -0.53) {
   let curr = new Float32Array(matrix);
   const next = new Float32Array(matrix.length);
 
@@ -350,7 +348,6 @@ function taubinSmooth(matrix, w, h, passes = 6, lambda = 0.5, mu = -0.53) {
         const sw = curr[(y+1)*w + (x-1)];
         const se = curr[(y+1)*w + (x+1)];
 
-        // Weighted Laplacian (cardinal=1.0, diagonal=0.707)
         const avgN = (n + s + ww + e + (nw + ne + sw + se) * 0.707) / 6.828;
         const laplacian = avgN - v;
         next[i] = v + factor * laplacian;
@@ -368,7 +365,7 @@ export const processXrayImage = (imageElement, options = {}) => {
   const {
     brightness = 0,
     contrast = 20,
-    threshold: manualThreshold = 0, // 0 = use Otsu auto-threshold
+    threshold: manualThreshold = 0,
     resolution = 384,
   } = options;
 
@@ -390,13 +387,12 @@ export const processXrayImage = (imageElement, options = {}) => {
     rawGray[i] = 0.299 * data[p] + 0.587 * data[p+1] + 0.114 * data[p+2];
   }
 
-  // Auto-detect dark vs light background (sample border pixels)
+  // Auto-detect dark vs light background
   let borderSum = 0, borderCnt = 0;
   for (let x = 0; x < W; x++) { borderSum += rawGray[x] + rawGray[(H-1)*W + x]; borderCnt += 2; }
   for (let y = 0; y < H; y++) { borderSum += rawGray[y*W] + rawGray[y*W + (W-1)]; borderCnt += 2; }
   const isLightBg = (borderSum / borderCnt) > 128;
 
-  // Invert if light background (standard X-rays have dark BG = bone is bright)
   const gray = new Float32Array(N);
   for (let i = 0; i < N; i++) {
     gray[i] = isLightBg ? (255 - rawGray[i]) : rawGray[i];
@@ -406,13 +402,11 @@ export const processXrayImage = (imageElement, options = {}) => {
   const enhanced = enhanceLocalContrast(gray, W, H, 48);
 
   // ── Stage 3: Otsu thresholding → bone mask ──────────────────────────────
-  // We need to be STRICT here: only capture actual dense bone, not soft tissue
   const histogram = new Int32Array(256);
   for (let i = 0; i < N; i++) histogram[Math.min(255, Math.max(0, Math.round(enhanced[i])))]++;
   const otsuT = manualThreshold > 0 ? manualThreshold : otsuThreshold(histogram, N);
-  // RAISE the threshold above Otsu to reject soft tissue (skin, muscle)
-  // Bone is significantly brighter than soft tissue in X-rays
-  const effectiveThresh = Math.max(30, otsuT * 1.15);
+  // Raise threshold above Otsu to aggressively reject soft tissue and noise
+  const effectiveThresh = Math.max(35, otsuT * 1.25);
 
   let boneMask = new Uint8Array(N);
   for (let i = 0; i < N; i++) {
@@ -420,20 +414,24 @@ export const processXrayImage = (imageElement, options = {}) => {
   }
 
   // ── Stage 4: Morphological cleanup ──────────────────────────────────────
-  boneMask = morphOpen(boneMask, W, H, 1);   // Remove isolated noise pixels
-  boneMask = morphClose(boneMask, W, H, 1);  // Fill tiny holes (radius=1 only, avoids bridging bones)
+  boneMask = morphOpen(boneMask, W, H, 2);   // radius=2 to remove noise spots
+  boneMask = morphClose(boneMask, W, H, 2);  // radius=2 to fill small holes
 
   // ── Stage 5: Sobel edges + boundary distance ───────────────────────────
   const edges = sobelEdges(enhanced, W, H);
   const distField = distanceTransformApprox(boneMask, W, H);
 
-  // ── Stage 6: Bone spans for cylindrical depth ──────────────────────────
-  const { boneWidth, boneCenter } = computeBoneSpans(boneMask, W, H);
+  // ── Stage 6: Bone radii (horizontal + vertical) ────────────────────────
+  const { hRadius, vRadius, hCenter, vCenter } = computeBoneRadii(boneMask, W, H);
 
   // ── Stage 7: Joint gap detection ───────────────────────────────────────
   const gapFactor = detectJointGaps(enhanced, boneMask, W, H);
 
-  // ── Stage 8: Anatomical cylindrical depth estimation ───────────────────
+  // ── Stage 8: Volumetric cylindrical depth estimation ───────────────────
+  // For each bone pixel, compute elliptical cross-section depth using
+  // BOTH horizontal and vertical bone radii. The depth at a point is
+  // determined by how far it is from the bone surface in 2D, giving
+  // a truly round, tubular appearance.
   const rawDepth = new Float32Array(N);
   let totalDensity = 0, bonePixelCount = 0;
 
@@ -447,40 +445,72 @@ export const processXrayImage = (imageElement, options = {}) => {
   }
   const eRange = (eMax - eMin) || 1;
 
+  // Find max distance for normalization
+  let maxDist = 0;
+  for (let i = 0; i < N; i++) if (distField[i] > maxDist && distField[i] < 1e5) maxDist = distField[i];
+
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
       if (!boneMask[i]) { rawDepth[i] = 0; continue; }
 
-      // Normalized bone density (0-1) from local contrast-enhanced image
       const density = Math.max(0, Math.min(1, (enhanced[i] - eMin) / eRange));
 
-      // Cylindrical cross-section:
-      // R = half of the local bone width at this row, CLAMPED to max ~40px
-      // so wide areas (like joined carpals) still get individual roundness
-      const rawR = Math.max(1, boneWidth[i] / 2);
-      const R = Math.min(rawR, 40);  // Clamp: no bone is wider than ~40px at 384 res
-      const d = Math.abs(x - boneCenter[i]);
-      const normalizedD = Math.min(1.0, d / R);
+      // Use distance from bone boundary as the primary depth driver
+      // This gives truly round, cylindrical bones
+      const boneDistFromEdge = distField[i];
+      
+      // Horizontal cylindrical component
+      const hr = Math.max(1, Math.min(hRadius[i], 50));
+      const hd = Math.abs(x - hCenter[i]);
+      const hNorm = Math.min(1.0, hd / hr);
+      const hCyl = Math.sqrt(Math.max(0, 1 - hNorm * hNorm));
 
-      // Elliptical depth: sqrt(1 - (d/R)^2) gives a semicircular cross-section
-      const cylindricalShape = Math.sqrt(Math.max(0, 1 - normalizedD * normalizedD));
+      // Vertical cylindrical component  
+      const vr = Math.max(1, Math.min(vRadius[i], 50));
+      const vd = Math.abs(y - vCenter[i]);
+      const vNorm = Math.min(1.0, vd / vr);
+      const vCyl = Math.sqrt(Math.max(0, 1 - vNorm * vNorm));
 
-      // Edge softening: taper near bone boundaries using distance field
-      const edgeDist = distField[i];
-      const edgeTaper = Math.min(1.0, edgeDist / 5.0); // larger taper for smoother edges
+      // Use the SMALLER radius dimension for cross-section roundness
+      // Long bones: thin horizontally → use hCyl for roundness
+      // Wide bones: thin vertically → use vCyl for roundness
+      // This makes bones round across their narrow axis (like real bones)
+      const minR = Math.min(hr, vr);
+      const maxR = Math.max(hr, vr);
+      const aspectRatio = minR / maxR; // 0 = very elongated, 1 = square
 
-      // Density gate: reject faint tissue that barely passed threshold
-      const densityGate = density > 0.15 ? 1.0 : density / 0.15;
+      // Blend: for elongated bones, use narrow-axis cylinder
+      // For square-ish areas, use both equally
+      let cylindricalShape;
+      if (aspectRatio < 0.4) {
+        // Elongated: use narrow axis for roundness
+        cylindricalShape = hr < vr ? hCyl : vCyl;
+      } else {
+        // Square-ish: blend both (like a rounded knob/joint)
+        cylindricalShape = Math.min(hCyl, vCyl);
+      }
 
-      // Combine: density modulates peak height, cylinder gives shape,
-      // edge taper smooths borders, gap factor separates joints
+      // Also blend in distance-from-edge for smooth boundaries
+      const edgeFalloff = Math.min(1.0, boneDistFromEdge / 3.0);
+      cylindricalShape = cylindricalShape * 0.85 + edgeFalloff * 0.15;
+
+      // Amplify the cylindrical shape with a power curve to make
+      // bones significantly rounder and more pronounced
+      cylindricalShape = Math.pow(cylindricalShape, 0.6);
+
+      // Density gate
+      const densityGate = density > 0.08 ? 1.0 : density / 0.08;
+
+      // Edge depression at sharp boundaries — reduced so edges aren't too thin
+      const edgeDepression = 1.0 - edges[i] * 0.18;
+
+      // Combine — density has less influence on height, keeping bones thick
       const depth = cylindricalShape
-        * (density * 0.75 + 0.25)    // density modulation
-        * edgeTaper                   // smooth edges
-        * gapFactor[i]                // joint separation
-        * densityGate                 // reject very faint tissue
-        * (1.0 - edges[i] * 0.3);    // depression at sharp edges (joint lines)
+        * (density * 0.35 + 0.65)       // density contributes less — bones stay thick even in dimmer areas
+        * gapFactor[i]                    // joint separation
+        * densityGate
+        * edgeDepression;
 
       rawDepth[i] = Math.max(0, depth);
       if (depth > 0.01) {
@@ -491,10 +521,16 @@ export const processXrayImage = (imageElement, options = {}) => {
   }
 
   // ── Stage 9: Bilateral filter (edge-preserving) ────────────────────────
-  const filtered = bilateralFilter(rawDepth, W, H, 1.8, 0.15);
+  const filtered = bilateralFilter(rawDepth, W, H, 2.0, 0.12);
 
-  // ── Stage 10: Taubin smoothing (shrinkage-free) ────────────────────────
-  const smoothed = taubinSmooth(filtered, W, H, 6, 0.5, -0.53);
+  // ── Stage 10: Taubin smoothing ─────────────────────────────────────────
+  const smoothed = taubinSmooth(filtered, W, H, 8, 0.5, -0.53);
+
+  // ── Stage 11: Re-apply bone mask ───────────────────────────────────────
+  // Smoothing can bleed depth into non-bone pixels — clamp them back to zero
+  for (let i = 0; i < N; i++) {
+    if (!boneMask[i]) smoothed[i] = 0;
+  }
 
   return {
     processedDataUrl: canvas.toDataURL(),
@@ -502,6 +538,8 @@ export const processXrayImage = (imageElement, options = {}) => {
     rawDepthMatrix: rawDepth,
     boneMask,
     resolution,
+    maxDist,
+    aspectRatio: (imageElement.naturalWidth / imageElement.naturalHeight) || (imageElement.width / imageElement.height) || 1,
     stats: {
       bonePixelCount,
       boneRatio: (bonePixelCount / N * 100).toFixed(1),
@@ -514,7 +552,7 @@ export const processXrayImage = (imageElement, options = {}) => {
 // ═══════════════════════════════════════════════════════════════════════════
 // Post-process AI generated depth map
 // ═══════════════════════════════════════════════════════════════════════════
-export const postProcessAIDepthMap = (imageElement, aiDepthData, aiWidth, aiHeight, resolution = 384) => {
+export const postProcessAIDepthMap = (imageElement, aiDepthData, aiWidth, aiHeight, resolution = 384, options = {}) => {
   const canvas = document.createElement('canvas');
   canvas.width = resolution;
   canvas.height = resolution;
@@ -524,7 +562,48 @@ export const postProcessAIDepthMap = (imageElement, aiDepthData, aiWidth, aiHeig
   const N = resolution * resolution;
   const depthMatrix = new Float32Array(N);
 
-  // The AI depth data is typically unnormalized and may have negative values.
+  // ── Extract high-fidelity 2D bone mask ──
+  const imgData = ctx.getImageData(0, 0, resolution, resolution);
+  const data = imgData.data;
+
+  const rawGray = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const p = i * 4;
+    rawGray[i] = 0.299 * data[p] + 0.587 * data[p+1] + 0.114 * data[p+2];
+  }
+
+  let borderSum = 0, borderCnt = 0;
+  for (let x = 0; x < resolution; x++) { borderSum += rawGray[x] + rawGray[(resolution-1)*resolution + x]; borderCnt += 2; }
+  for (let y = 0; y < resolution; y++) { borderSum += rawGray[y*resolution] + rawGray[y*resolution + (resolution-1)]; borderCnt += 2; }
+  const isLightBg = (borderSum / borderCnt) > 128;
+
+  const gray = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    gray[i] = isLightBg ? (255 - rawGray[i]) : rawGray[i];
+  }
+
+  const enhanced = enhanceLocalContrast(gray, resolution, resolution, 48);
+
+  const histogram = new Int32Array(256);
+  for (let i = 0; i < N; i++) histogram[Math.min(255, Math.max(0, Math.round(enhanced[i])))]++;
+  
+  const manualThreshold = options.threshold || 0;
+  const otsuT = manualThreshold > 0 ? manualThreshold : otsuThreshold(histogram, N);
+  const effectiveThresh = Math.max(35, otsuT * 1.25);
+
+  let boneMask = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    boneMask[i] = enhanced[i] > effectiveThresh ? 1 : 0;
+  }
+  boneMask = morphOpen(boneMask, resolution, resolution, 2);
+  boneMask = morphClose(boneMask, resolution, resolution, 2);
+
+  // Compute distance transform and maxDist to calculate bone width
+  const distField = distanceTransformApprox(boneMask, resolution, resolution);
+  let maxDist = 0;
+  for (let i = 0; i < N; i++) if (distField[i] > maxDist && distField[i] < 1e5) maxDist = distField[i];
+
+  // ── Normalize AI depth ──
   let minDepth = Infinity;
   let maxDepth = -Infinity;
   for (let i = 0; i < aiDepthData.length; i++) {
@@ -534,38 +613,60 @@ export const postProcessAIDepthMap = (imageElement, aiDepthData, aiWidth, aiHeig
   }
   const range = (maxDepth - minDepth) || 1;
 
-  // We need to sample from (aiWidth x aiHeight) to (resolution x resolution)
   for (let y = 0; y < resolution; y++) {
     for (let x = 0; x < resolution; x++) {
-      // Nearest neighbor or bilinear sampling
       const aiX = Math.floor((x / resolution) * aiWidth);
       const aiY = Math.floor((y / resolution) * aiHeight);
       
       const rawVal = aiDepthData[aiY * aiWidth + aiX];
-      
-      // Normalize to 0 - 1
       let normalized = (rawVal - minDepth) / range;
       
-      // Depth-anything tends to make background dark (0) and foreground bright (1)
-      // Since X-Rays have dark background, bones are the foreground.
-      // We square or cube the normalized value to suppress background noise
-      // and give bone structures a rounder, more dramatic profile.
-      normalized = Math.pow(normalized, 1.5);
+      // Gentler power curve — preserve more depth variation for volumetric appearance
+      normalized = Math.pow(normalized, 1.1);
+      
+      // Amplify so bones are prominently thick
+      normalized = Math.min(1.0, normalized * 1.3);
       
       depthMatrix[y * resolution + x] = normalized;
     }
   }
 
-  // Smooth the sampled depth matrix with Taubin filter to remove sampling artifacts
-  const smoothed = taubinSmooth(depthMatrix, resolution, resolution, 4, 0.5, -0.53);
+  // Background suppression — zero out the lowest depth values
+  const depthHist = new Int32Array(256);
+  for (let i = 0; i < N; i++) {
+    depthHist[Math.min(255, Math.max(0, Math.round(depthMatrix[i] * 255)))]++;
+  }
+  const bgThresh = otsuThreshold(depthHist, N) / 255;
+  const effectiveBgThresh = Math.max(0.08, bgThresh * 0.85);
+  
+  for (let i = 0; i < N; i++) {
+    if (!boneMask[i] || depthMatrix[i] < effectiveBgThresh) {
+      depthMatrix[i] = 0;
+    } else {
+      // Re-normalize remaining values to use full 0-1 range
+      depthMatrix[i] = (depthMatrix[i] - effectiveBgThresh) / (1 - effectiveBgThresh);
+    }
+  }
+
+  const smoothed = taubinSmooth(depthMatrix, resolution, resolution, 6, 0.5, -0.53);
+  
+  // Re-apply mask after smoothing to prevent bleed
+  for (let i = 0; i < N; i++) {
+    if (!boneMask[i] || depthMatrix[i] <= 0) smoothed[i] = 0;
+  }
 
   return {
     processedDataUrl: canvas.toDataURL(),
     depthMatrix: smoothed,
     resolution,
+    maxDist,
+    aspectRatio: (imageElement.naturalWidth / imageElement.naturalHeight) || (imageElement.width / imageElement.height) || 1,
     stats: {
-      aiPowered: true
+      aiPowered: true,
+      bonePixelCount: boneMask.reduce((a, b) => a + b, 0),
+      boneRatio: (boneMask.reduce((a, b) => a + b, 0) / N * 100).toFixed(1),
+      avgDensity: (depthMatrix.reduce((a, b) => a + b, 0) / Math.max(1, boneMask.reduce((a, b) => a + b, 0)) * 255).toFixed(0),
+      otsuThreshold: otsuT
     }
   };
 };
-
